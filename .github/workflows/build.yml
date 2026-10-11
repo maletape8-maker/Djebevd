@@ -1,0 +1,184 @@
+name: Build KeyboardSwipe dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Écrire le code source
+        run: |
+          cat > KeyboardSwipe.mm <<'EOF'
+          // KeyboardSwipe.mm — clavier -> swipes (flèches + ZQSD)
+          #import <UIKit/UIKit.h>
+          #import <GameController/GameController.h>
+
+          // ---- API privées UIKit pour fabriquer des touches ----
+          @interface UITouch (Fake)
+          - (void)setPhase:(UITouchPhase)phase;
+          - (void)setTapCount:(NSUInteger)c;
+          - (void)setIsTap:(BOOL)b;
+          - (void)setTimestamp:(NSTimeInterval)t;
+          - (void)setWindow:(UIWindow *)w;
+          - (void)setView:(UIView *)v;
+          - (void)_setLocationInWindow:(CGPoint)p resetPrevious:(BOOL)r;
+          - (void)_setIsFirstTouchForView:(BOOL)b;
+          @end
+          @interface UIEvent (Fake)
+          - (void)_clearTouches;
+          - (void)_addTouch:(UITouch *)t forDelayedDelivery:(BOOL)d;
+          @end
+          @interface UIApplication (Fake)
+          - (UIEvent *)_touchesEvent;
+          @end
+
+          // ---- Réglages ----
+          static const CGFloat   kSwipeDistance = 220.0;
+          static const NSTimeInterval kSwipeTime = 0.06;
+          static const NSTimeInterval kMinHold   = 0.03;
+
+          enum { DirUp, DirDown, DirLeft, DirRight };
+
+          static int  gHeld[4]      = {0, 0, 0, 0};
+          static NSMutableArray<NSNumber *> *gQueue;
+          static BOOL gActive       = NO;
+          static int  gDir          = 0;
+          static CFTimeInterval gStart = 0;
+          static CGPoint gOrigin;
+          static UITouch *gTouch    = nil;
+          static UIWindow *gWindow  = nil;
+
+          static UIWindow *FindWindow(void) {
+              for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                  if (![s isKindOfClass:UIWindowScene.class]) continue;
+                  for (UIWindow *w in ((UIWindowScene *)s).windows)
+                      if (w.isKeyWindow) return w;
+              }
+              return UIApplication.sharedApplication.windows.firstObject;
+          }
+
+          static void SendTouch(UITouchPhase phase, CGPoint p) {
+              UIApplication *app = UIApplication.sharedApplication;
+              if (phase == UITouchPhaseBegan) {
+                  gTouch = [[UITouch alloc] init];
+                  [gTouch setTapCount:1];
+                  [gTouch setIsTap:YES];
+                  [gTouch setWindow:gWindow];
+                  [gTouch _setLocationInWindow:p resetPrevious:YES];
+                  UIView *v = [gWindow hitTest:p withEvent:nil];
+                  [gTouch setView:v ?: gWindow];
+                  [gTouch _setIsFirstTouchForView:YES];
+              } else {
+                  [gTouch _setLocationInWindow:p resetPrevious:NO];
+              }
+              [gTouch setPhase:phase];
+              [gTouch setTimestamp:NSProcessInfo.processInfo.systemUptime];
+
+              UIEvent *ev = [app _touchesEvent];
+              [ev _clearTouches];
+              [ev _addTouch:gTouch forDelayedDelivery:NO];
+              [app sendEvent:ev];
+          }
+
+          static CGPoint PointFor(int dir, CGFloat progress) {
+              CGFloat d = kSwipeDistance * progress;
+              CGPoint p = gOrigin;
+              switch (dir) {
+                  case DirUp:    p.y -= d; break;
+                  case DirDown:  p.y += d; break;
+                  case DirLeft:  p.x -= d; break;
+                  case DirRight: p.x += d; break;
+              }
+              return p;
+          }
+
+          static void Tick(void) {
+              CFTimeInterval now = CACurrentMediaTime();
+
+              if (!gActive) {
+                  if (gQueue.count == 0) return;
+                  gWindow = FindWindow();
+                  if (!gWindow) { [gQueue removeAllObjects]; return; }
+                  gDir = gQueue.firstObject.intValue;
+                  [gQueue removeObjectAtIndex:0];
+                  gOrigin = CGPointMake(CGRectGetMidX(gWindow.bounds), CGRectGetMidY(gWindow.bounds));
+                  gStart = now;
+                  gActive = YES;
+                  SendTouch(UITouchPhaseBegan, gOrigin);
+                  return;
+              }
+
+              CFTimeInterval el = now - gStart;
+              CGFloat prog = (CGFloat)MIN(1.0, el / kSwipeTime);
+              SendTouch(UITouchPhaseMoved, PointFor(gDir, prog));
+
+              if (prog >= 1.0 && el >= kSwipeTime + kMinHold) {
+                  if (gHeld[gDir] == 0 || gQueue.count > 0) {
+                      SendTouch(UITouchPhaseEnded, PointFor(gDir, 1.0));
+                      gTouch = nil;
+                      gActive = NO;
+                  }
+              }
+          }
+
+          static int DirForKey(GCKeyCode k) {
+              if (k == GCKeyCodeUpArrow    || k == GCKeyCodeKeyW) return DirUp;
+              if (k == GCKeyCodeDownArrow  || k == GCKeyCodeKeyS) return DirDown;
+              if (k == GCKeyCodeLeftArrow  || k == GCKeyCodeKeyA) return DirLeft;
+              if (k == GCKeyCodeRightArrow || k == GCKeyCodeKeyD) return DirRight;
+              return -1;
+          }
+
+          static void SetupKeyboard(void) {
+              GCKeyboard *kb = GCKeyboard.coalescedKeyboard;
+              if (!kb) return;
+              kb.keyboardInput.keyChangedHandler =
+              ^(GCKeyboardInput *input, GCControllerButtonInput *key, GCKeyCode code, BOOL pressed) {
+                  int d = DirForKey(code);
+                  if (d < 0) return;
+                  if (pressed) {
+                      if (gHeld[d]++ == 0) [gQueue addObject:@(d)];
+                  } else if (gHeld[d] > 0) {
+                      gHeld[d]--;
+                  }
+              };
+          }
+
+          __attribute__((constructor))
+          static void KeyboardSwipeInit(void) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  gQueue = [NSMutableArray array];
+
+                  [NSNotificationCenter.defaultCenter
+                      addObserverForName:GCKeyboardDidConnectNotification
+                                  object:nil queue:NSOperationQueue.mainQueue
+                              usingBlock:^(NSNotification *n) { SetupKeyboard(); }];
+
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), ^{
+                      SetupKeyboard();
+                      NSTimer *t = [NSTimer timerWithTimeInterval:1.0/120.0 repeats:YES
+                                                            block:^(NSTimer *tm) { Tick(); }];
+                      [NSRunLoop.mainRunLoop addTimer:t forMode:NSRunLoopCommonModes];
+                  });
+              });
+          }
+          EOF
+
+      - name: Compiler le dylib
+        run: |
+          xcrun -sdk iphoneos clang++ -arch arm64 -dynamiclib -fobjc-arc \
+            -miphoneos-version-min=14.0 \
+            -framework UIKit -framework Foundation -framework GameController \
+            -o KeyboardSwipe.dylib KeyboardSwipe.mm
+
+      - name: Signer
+        run: codesign -f -s - KeyboardSwipe.dylib
+
+      - name: Envoyer le dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeyboardSwipe-dylib
+          path: KeyboardSwipe.dylib
